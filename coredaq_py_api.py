@@ -18,6 +18,8 @@ from typing import List
 from array import array
 import serial
 import serial.tools.list_ports
+import warnings
+
 
 
 class CoreDAQError(Exception):
@@ -277,7 +279,7 @@ class CoreDAQ:
     def trig_arm(self, frames: int, rising: bool = True):
         if frames <= 0:
             raise ValueError("frames must be > 0")
-        pol = "R" if rising else "F"
+        pol = "R" if rising else "F"    
         line = self._ask(f"TRIGARM {frames} {pol}")
         if not line.startswith("OK"):
             raise CoreDAQError(line)
@@ -289,21 +291,92 @@ class CoreDAQ:
             raise CoreDAQError(line)
         return self._parse_int(line[2:].strip())
 
-    def set_freq(self, hz: int):
-        line = self._ask(f"FREQ {hz}")
-        if not line.startswith("OK"):
-            raise CoreDAQError(line)
-
-    def set_oversampling(self, os_idx: int):
-        line = self._ask(f"OS {os_idx}")
-        if not line.startswith("OK"):
-            raise CoreDAQError(line)
-
     def get_oversampling(self) -> int:
         line = self._ask("OS?")
         if not line.startswith("OK"):
             raise CoreDAQError(line)
         return self._parse_int(line[2:].strip())
+    
+    def _max_freq_for_os(self, os_idx: int) -> int:
+        if not (0 <= os_idx <= 7):
+            raise ValueError("os_idx must be 0..7")
+        base = 100_000
+        if os_idx <= 1:
+            return base
+        return base // (2 ** (os_idx - 1))   # OS2->50k, OS3->25k, ...
+
+    def _best_os_for_freq(self, hz: int) -> int:
+        """Return the HIGHEST oversampling index that is still legal for hz."""
+        if hz <= 0:
+            raise ValueError("hz must be > 0")
+        if hz > 100_000:
+            raise ValueError("hz must be <= 100000")
+
+        best = 0
+        for os_idx in range(0, 8):
+            if hz <= self._max_freq_for_os(os_idx):
+                best = os_idx
+            else:
+                break
+        return best
+
+    def set_freq(self, hz: int):
+        """
+        Master setting.
+        Sets FREQ first. Then adjusts OS downward if the current OS is illegal.
+        """
+        if hz <= 0 or hz > 100_000:
+            raise CoreDAQError("FREQ must be 1..100000 Hz")
+
+        # Set frequency
+        st, p = self._ask(f"FREQ {hz}")
+        if st != "OK":
+            raise CoreDAQError(p)
+
+        # Ensure current OS still legal; if not, reduce OS and warn
+        cur_os = self.get_oversampling()
+        if hz > self._max_freq_for_os(cur_os):
+            new_os = self._best_os_for_freq(hz)
+            st, p = self._ask(f"OS {new_os}")
+            if st != "OK":
+                raise CoreDAQError(p)
+
+            warnings.warn(
+                f"OS {cur_os} is not valid at {hz} Hz. Auto-adjusted OS to {new_os}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    def set_oversampling(self, os_idx: int):
+        """
+        Secondary setting.
+        If requested OS is illegal for current FREQ, auto-adjust OS to a legal one
+        and warn (frequency remains unchanged).
+        """
+        if not (0 <= os_idx <= 7):
+            raise CoreDAQError("OS must be 0..7")
+
+        hz = self.get_freq_hz()
+
+        # If illegal, choose the best OS that still supports the current frequency
+        if hz > self._max_freq_for_os(os_idx):
+            new_os = self._best_os_for_freq(hz)
+
+            st, p = self._ask(f"OS {new_os}")
+            if st != "OK":
+                raise CoreDAQError(p)
+
+            warnings.warn(
+                f"Requested OS {os_idx} is not valid at {hz} Hz. "
+                f"Kept FREQ={hz} Hz and set OS to {new_os}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+
+        st, p = self._ask(f"OS {os_idx}")
+        if st != "OK":
+            raise CoreDAQError(p)
 
     # ---------- Sensors ----------
     def get_head_temperature_C(self) -> float:
