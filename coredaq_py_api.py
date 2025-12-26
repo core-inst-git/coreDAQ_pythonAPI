@@ -18,7 +18,7 @@ from typing import List
 from array import array
 import serial
 import serial.tools.list_ports
-import warnings
+import warnings, math
 
 
 
@@ -90,6 +90,22 @@ class CoreDAQ:
             self._writeln(cmd)
             line = self._readline()
         return line
+
+    @staticmethod
+    def _split_reply(line: str):
+        """Split device reply into (status, payload).
+
+        Expected formats:
+          OK <payload>
+          ERR <payload>
+          BUSY <payload>
+        """
+        if not line:
+            return "ERR", "EMPTY"
+        parts = line.split(maxsplit=1)
+        st = parts[0]
+        payload = parts[1] if len(parts) > 1 else ""
+        return st, payload
 
     @staticmethod
     def _parse_int(s: str) -> int:
@@ -221,7 +237,7 @@ class CoreDAQ:
         Dev  -> Host: OK ...
                     <binary payload>
 
-        Returns: [ch1, ch2, ch3, ch4] in mV (0.1 mV resolution)
+        Returns: [ch1, ch2, ch3, ch4] as ADC codes (int16)
         """
         if frames <= 0:
             raise ValueError("frames must be > 0")
@@ -285,25 +301,28 @@ class CoreDAQ:
             raise CoreDAQError(line)
 
     # ---------- FREQ / Oversampling (optional) ----------
+    # ---------- FREQ / Oversampling (optional) ----------
     def get_freq_hz(self) -> int:
         line = self._ask("FREQ?")
-        if not line.startswith("OK"):
+        st, p = self._split_reply(line)
+        if st != "OK":
             raise CoreDAQError(line)
-        return self._parse_int(line[2:].strip())
+        return self._parse_int(p.strip())
 
     def get_oversampling(self) -> int:
         line = self._ask("OS?")
-        if not line.startswith("OK"):
+        st, p = self._split_reply(line)
+        if st != "OK":
             raise CoreDAQError(line)
-        return self._parse_int(line[2:].strip())
-    
+        return self._parse_int(p.strip())
+
     def _max_freq_for_os(self, os_idx: int) -> int:
         if not (0 <= os_idx <= 7):
             raise ValueError("os_idx must be 0..7")
         base = 100_000
         if os_idx <= 1:
             return base
-        return base // (2 ** (os_idx - 1))   # OS2->50k, OS3->25k, ...
+        return base // (2 ** (os_idx - 1))
 
     def _best_os_for_freq(self, hz: int) -> int:
         """Return the HIGHEST oversampling index that is still legal for hz."""
@@ -311,7 +330,6 @@ class CoreDAQ:
             raise ValueError("hz must be > 0")
         if hz > 100_000:
             raise ValueError("hz must be <= 100000")
-
         best = 0
         for os_idx in range(0, 8):
             if hz <= self._max_freq_for_os(os_idx):
@@ -321,25 +339,22 @@ class CoreDAQ:
         return best
 
     def set_freq(self, hz: int):
-        """
-        Master setting.
-        Sets FREQ first. Then adjusts OS downward if the current OS is illegal.
-        """
+        """Master setting: set FREQ. If current OS becomes illegal, lower OS and warn."""
         if hz <= 0 or hz > 100_000:
             raise CoreDAQError("FREQ must be 1..100000 Hz")
 
-        # Set frequency
-        st, p = self._ask(f"FREQ {hz}")
+        line = self._ask(f"FREQ {hz}")
+        st, p = self._split_reply(line)
         if st != "OK":
-            raise CoreDAQError(p)
+            raise CoreDAQError(line)
 
-        # Ensure current OS still legal; if not, reduce OS and warn
         cur_os = self.get_oversampling()
         if hz > self._max_freq_for_os(cur_os):
             new_os = self._best_os_for_freq(hz)
-            st, p = self._ask(f"OS {new_os}")
-            if st != "OK":
-                raise CoreDAQError(p)
+            line2 = self._ask(f"OS {new_os}")
+            st2, _ = self._split_reply(line2)
+            if st2 != "OK":
+                raise CoreDAQError(line2)
 
             warnings.warn(
                 f"OS {cur_os} is not valid at {hz} Hz. Auto-adjusted OS to {new_os}.",
@@ -348,35 +363,124 @@ class CoreDAQ:
             )
 
     def set_oversampling(self, os_idx: int):
-        """
-        Secondary setting.
-        If requested OS is illegal for current FREQ, auto-adjust OS to a legal one
-        and warn (frequency remains unchanged).
-        """
+        """Secondary setting: keep current FREQ. If requested OS is illegal, adjust OS and warn."""
         if not (0 <= os_idx <= 7):
             raise CoreDAQError("OS must be 0..7")
 
         hz = self.get_freq_hz()
-
-        # If illegal, choose the best OS that still supports the current frequency
         if hz > self._max_freq_for_os(os_idx):
             new_os = self._best_os_for_freq(hz)
-
-            st, p = self._ask(f"OS {new_os}")
+            line = self._ask(f"OS {new_os}")
+            st, _ = self._split_reply(line)
             if st != "OK":
-                raise CoreDAQError(p)
+                raise CoreDAQError(line)
 
             warnings.warn(
-                f"Requested OS {os_idx} is not valid at {hz} Hz. "
-                f"Kept FREQ={hz} Hz and set OS to {new_os}.",
+                f"Requested OS {os_idx} is not valid at {hz} Hz. Kept FREQ={hz} Hz and set OS to {new_os}.",
                 RuntimeWarning,
                 stacklevel=2,
             )
             return
 
-        st, p = self._ask(f"OS {os_idx}")
+        line = self._ask(f"OS {os_idx}")
+        st, _ = self._split_reply(line)
         if st != "OK":
-            raise CoreDAQError(p)
+            raise CoreDAQError(line)
+
+    def transfer_frames_mV(self, frames: int) -> List[List[float]]:
+        """Transfer <frames> and convert ADC codes -> mV (float, physical resolution)."""
+        codes_ch = self.transfer_frames_raw(frames)
+
+        # AD7606 bipolar scaling: mV per code
+        mv_per_code = (2.0 * self.FS_VOLTS * 1000.0) / (2.0 * self.CODES_PER_FS)
+        # Note: using CODES_PER_FS=32768 for ±FS maps naturally to signed int16.
+        # mv_per_code simplifies to (FS_VOLTS*1000)/CODES_PER_FS.
+        mv_per_code = (self.FS_VOLTS * 1000.0) / float(self.CODES_PER_FS)
+
+        mv_ch: List[List[float]] = [[], [], [], []]
+        for ch in range(4):
+            mv_ch[ch] = [float(code) * mv_per_code for code in codes_ch[ch]]
+        return mv_ch
+
+    def get_gains(self) -> List[int]:
+        """Query current gain index for each head.
+
+        Expected device reply:
+          OK <g1> <g2> <g3> <g4>
+        """
+        line = self._ask("GAINS?")
+        st, p = self._split_reply(line)
+        if st != "OK":
+            # fallback older firmware name
+            line = self._ask("GAIN?")
+            st, p = self._split_reply(line)
+            if st != "OK":
+                raise CoreDAQError(line)
+
+        parts = p.split()
+        if len(parts) < 4:
+            raise CoreDAQError(f"Bad GAINS payload: {p!r}")
+        try:
+            return [int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])]
+        except Exception as e:
+            raise CoreDAQError(f"Bad GAINS integers: {p!r}") from e
+
+    def transfer_frames_W(self, frames: int, use_zero: bool = False) -> List[List[float]]:
+        """Transfers <frames> frames, converts them to optical power (W) using calibration."""
+        if not hasattr(self, "_cal_slope") or not hasattr(self, "_cal_intercept"):
+            raise CoreDAQError("Calibration data (_cal_slope/_cal_intercept) not loaded.")
+
+        mv_ch = self.transfer_frames_mV(frames)
+        gains = self.get_gains()
+
+        adc_mv_per_lsb = (self.FS_VOLTS * 1000.0) / float(self.CODES_PER_FS)
+        power_ch: List[List[float]] = [[], [], [], []]
+
+        # Optional zeroing arrays
+        have_zero = hasattr(self, "_zero_mv") and self._zero_mv is not None
+        mv_zero_thr = float(getattr(self, "_mv_zero_threshold", 0.0))
+        sat_mv = float(getattr(self, "_sat_mv", 4900.0))
+
+        for ch in range(4):
+            head_idx = ch
+            gain = int(gains[ch])
+
+            try:
+                slope_mV_per_W = float(self._cal_slope[head_idx][gain])
+                intercept_mV = float(self._cal_intercept[head_idx][gain])
+            except Exception as e:
+                raise CoreDAQError(f"No calibration data for head {head_idx+1}, gain {gain}") from e
+
+            if slope_mV_per_W == 0.0:
+                raise CoreDAQError(f"Invalid slope for head {head_idx+1}, gain {gain}: {slope_mV_per_W}")
+
+            power_lsb = adc_mv_per_lsb / slope_mV_per_W
+            if power_lsb <= 0.0:
+                decimals = 0
+            else:
+                decimals = max(0, min(12, int(round(-math.log10(power_lsb)))))
+
+            out = power_ch[ch]
+            for v_mv in mv_ch[ch]:
+                mv_corr = float(v_mv)
+
+                if use_zero and have_zero:
+                    mv_corr -= float(self._zero_mv[head_idx][gain])
+
+                # If ADC wraps negative at clip, treat as saturation
+                if mv_corr < 0.0:
+                    mv_corr = sat_mv
+
+                if mv_zero_thr > 0.0 and abs(mv_corr) < mv_zero_thr:
+                    out.append(0.0)
+                    continue
+
+                p_w = (mv_corr - intercept_mV) / slope_mV_per_W
+                if p_w < 0.0:
+                    p_w = 0.0
+                out.append(round(p_w, decimals))
+
+        return power_ch
 
     # ---------- Sensors ----------
     def get_head_temperature_C(self) -> float:
