@@ -14,7 +14,7 @@
     <li>Optical power measurement</li>
     <li>Swept-source photonic component characterization</li>
     <li>Multi-channel power monitoring</li>
-    <li>High-speed streaming (millions of samples)</li>
+    <li>High-speed streaming </li>
     <li>Triggered acquisition</li>
     <li>Gain control (index-based or power-based)</li>
     <li>Calibration-corrected optical power</li>
